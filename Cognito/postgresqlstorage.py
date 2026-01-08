@@ -1,9 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
-import boto3
-import uuid
-import requests
+import boto3, uuid, requests
 from jose import jwt
 
 from sqlalchemy import (
@@ -12,25 +10,24 @@ from sqlalchemy import (
     Integer,
     String,
     DateTime,
-    func
+    func,
+    or_
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.dialects.postgresql import UUID
 
+
+from botocore.exceptions import ClientError
+from sqlalchemy.exc import IntegrityError
 # ======================================================
-# FASTAPI (Swagger Tags)
+# FASTAPI
 # ======================================================
+
 app = FastAPI(
     title="FastAPI + Cognito + PostgreSQL",
     openapi_tags=[
-        {
-            "name": "Cognito Auth",
-            "description": "Signup, OTP verification and login using AWS Cognito",
-        },
-        {
-            "name": "User Management",
-            "description": "Protected user CRUD operations using Cognito Access Token",
-        },
+        {"name": "Cognito Auth"},
+        {"name": "User Management"},
     ],
 )
 
@@ -39,38 +36,30 @@ app = FastAPI(
 # ======================================================
 AWS_REGION = "eu-north-1"
 CLIENT_ID = "4n04p83m29pupn8ej4c57siv73"
-USER_POOL_ID = "eu-north-1_v7502wNHH"  # ✅ correct & required
-
+USER_POOL_ID = "eu-north-1_v7502wNHH"
 cognito = boto3.client("cognito-idp", region_name=AWS_REGION)
 
 # ======================================================
 # TOKEN VALIDATION
 # ======================================================
 security = HTTPBearer()
-
-COGNITO_ISSUER = f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{USER_POOL_ID}"
-JWKS_URL = f"{COGNITO_ISSUER}/.well-known/jwks.json"
-jwks = requests.get(JWKS_URL).json()
+ISSUER = f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{USER_POOL_ID}"
+jwks = requests.get(f"{ISSUER}/.well-known/jwks.json").json()
 
 def verify_access_token(
-    credentials: HTTPAuthorizationCredentials = Security(security)
+    credentials: HTTPAuthorizationCredentials = Security(security),
 ):
     token = credentials.credentials
-    try:
-        header = jwt.get_unverified_header(token)
-        key = next(k for k in jwks["keys"] if k["kid"] == header["kid"])
+    header = jwt.get_unverified_header(token)
+    key = next(k for k in jwks["keys"] if k["kid"] == header["kid"])
 
-        payload = jwt.decode(
-            token,
-            key,
-            algorithms=["RS256"],
-            issuer=COGNITO_ISSUER,
-            options={"verify_aud": False},
-        )
-        return payload
-
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired access token")
+    return jwt.decode(
+        token,
+        key,
+        algorithms=["RS256"],
+        issuer=ISSUER,
+        options={"verify_aud": False},
+    )
 
 # ======================================================
 # DATABASE
@@ -81,23 +70,22 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 # ======================================================
-# USER MODEL
+# MODEL
 # ======================================================
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     cognito_user_id = Column(UUID(as_uuid=True), unique=True, nullable=False)
-
-    first_name = Column(String(100), nullable=False)
-    last_name = Column(String(100), nullable=False)
+    first_name = Column(String(100))
+    last_name = Column(String(100))
     age = Column(Integer)
-    email = Column(String(255), unique=True, index=True, nullable=False)
+    email = Column(String(255), unique=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    last_login_at = Column(DateTime(timezone=True))
-    deleted_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    last_login_at = Column(DateTime)
+    deleted_at = Column(DateTime)
 
 Base.metadata.create_all(bind=engine)
 
@@ -112,10 +100,6 @@ class SignupRequest(BaseModel):
     password: str
     confirm_password: str
 
-class OtpVerifyRequest(BaseModel):
-    email: EmailStr
-    otp: str
-
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
@@ -125,25 +109,84 @@ class UpdateUserRequest(BaseModel):
     last_name: str | None = None
     age: int | None = None
 
+class OtpVerifyRequest(BaseModel):
+    email: EmailStr
+    otp: str
+# ======================================================
+# HELPER: FIND USER BY ANY IDENTIFIER
+# ======================================================
+def find_user(db, identifier: str):
+    # ID or AGE
+    if identifier.isdigit():
+        return db.query(User).filter(
+            or_(
+                User.id == int(identifier),
+                User.age == int(identifier)
+            ),
+            User.deleted_at.is_(None)
+        ).first()
+
+    # UUID
+    try:
+        return db.query(User).filter(
+            User.cognito_user_id == uuid.UUID(identifier),
+            User.deleted_at.is_(None)
+        ).first()
+    except ValueError:
+        pass
+
+    # EMAIL
+    if "@" in identifier:
+        return db.query(User).filter(
+            User.email.ilike(identifier),
+            User.deleted_at.is_(None)
+        ).first()
+
+    # NAME (partial match)
+    return db.query(User).filter(
+        or_(
+            User.first_name.ilike(f"%{identifier}%"),
+            User.last_name.ilike(f"%{identifier}%")
+        ),
+        User.deleted_at.is_(None)
+    ).first()
+
 # ======================================================
 # SIGNUP
 # ======================================================
+from botocore.exceptions import ClientError
+from sqlalchemy.exc import IntegrityError
+
 @app.post("/signup", tags=["Cognito Auth"])
 def signup(request: SignupRequest):
     if request.password != request.confirm_password:
         raise HTTPException(status_code=400, detail="Passwords do not match")
 
     try:
+        # --- Cognito signup ---
         res = cognito.sign_up(
             ClientId=CLIENT_ID,
             Username=request.email,
             Password=request.password,
             UserAttributes=[
                 {"Name": "email", "Value": request.email},
-                {"Name": "given_name", "Value": request.first_name},
-                {"Name": "family_name", "Value": request.last_name},
             ],
         )
+
+        # --- DB insert ---
+        db = SessionLocal()
+        user = User(
+            cognito_user_id=uuid.UUID(res["UserSub"]),
+            first_name=request.first_name,
+            last_name=request.last_name,
+            age=request.age,
+            email=request.email,
+        )
+        db.add(user)
+        db.commit()
+        db.close()
+
+        return {"message": "Signup successful. OTP sent to email"}
 
     except cognito.exceptions.UsernameExistsException:
         raise HTTPException(
@@ -151,41 +194,48 @@ def signup(request: SignupRequest):
             detail="User already exists. Please verify OTP or login.",
         )
 
-    except cognito.exceptions.InvalidPasswordException as e:
+    except IntegrityError:
         raise HTTPException(
             status_code=400,
-            detail=str(e),
+            detail="User already exists in database",
+        )
+
+    except ClientError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=e.response["Error"]["Message"],
         )
 
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Cognito error: {str(e)}",
+            detail=str(e),
         )
 
-    db = SessionLocal()
-    db.add(User(
-        cognito_user_id=uuid.UUID(res["UserSub"]),
-        first_name=request.first_name,
-        last_name=request.last_name,
-        age=request.age,
-        email=request.email,
-    ))
-    db.commit()
-
-    return {"message": "Signup successful. OTP sent to email"}
-
 # ======================================================
-# VERIFY OTP
+# VERIFY OTP (MANDATORY)
 # ======================================================
 @app.post("/verify-otp", tags=["Cognito Auth"])
 def verify_otp(request: OtpVerifyRequest):
-    cognito.confirm_sign_up(
-        ClientId=CLIENT_ID,
-        Username=request.email,
-        ConfirmationCode=request.otp,
-    )
-    return {"message": "OTP verified successfully"}
+    try:
+        cognito.confirm_sign_up(
+            ClientId=CLIENT_ID,
+            Username=request.email,
+            ConfirmationCode=request.otp,
+        )
+        return {"message": "OTP verified successfully. You can login now."}
+
+    except cognito.exceptions.CodeMismatchException:
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+
+    except cognito.exceptions.ExpiredCodeException:
+        raise HTTPException(status_code=400, detail="OTP expired")
+
+    except cognito.exceptions.UserNotFoundException:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ======================================================
 # LOGIN
@@ -214,30 +264,45 @@ def login(request: LoginRequest):
     return response["AuthenticationResult"]
 
 # ======================================================
-# GET USERS (PROTECTED)
+# GET USER BY IDENTIFIER
 # ======================================================
 @app.get("/users", tags=["User Management"])
-def get_users(token=Depends(verify_access_token)):
+def get_logged_in_user(
+    token_payload=Depends(verify_access_token),
+):
     db = SessionLocal()
-    return db.query(User).filter(User.deleted_at.is_(None)).all()
+
+    # UUID from Cognito access token
+    cognito_uuid = uuid.UUID(token_payload["sub"])
+
+    user = db.query(User).filter(
+        User.cognito_user_id == cognito_uuid,
+        User.deleted_at.is_(None)
+    ).first()
+
+    db.close()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return user
+
+
 
 # ======================================================
-# UPDATE USER (PROTECTED)
+# UPDATE USER BY IDENTIFIER
 # ======================================================
-@app.put("/users/{user_id}", tags=["User Management"])
+@app.put("/users/search", tags=["User Management"])
 def update_user(
-    user_id: int,
+    identifier: str,
     request: UpdateUserRequest,
     token=Depends(verify_access_token),
 ):
     db = SessionLocal()
-    user = db.query(User).filter(
-        User.id == user_id,
-        User.deleted_at.is_(None)
-    ).first()
+    user = find_user(db, identifier)
 
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(404, "User not found")
 
     if request.first_name:
         user.first_name = request.first_name
@@ -247,26 +312,32 @@ def update_user(
         user.age = request.age
 
     db.commit()
-    return {"message": "User updated successfully"}
+
+    return {
+        "message": "User updated",
+        "id": user.id,
+        "uuid": str(user.cognito_user_id),
+    }
 
 # ======================================================
-# DELETE USER (PROTECTED)
+# DELETE USER BY IDENTIFIER (SOFT DELETE)
 # ======================================================
-@app.delete("/users/{user_id}", tags=["User Management"])
+@app.delete("/users/search", tags=["User Management"])
 def delete_user(
-    user_id: int,
+    identifier: str,
     token=Depends(verify_access_token),
 ):
     db = SessionLocal()
-    user = db.query(User).filter(
-        User.id == user_id,
-        User.deleted_at.is_(None)
-    ).first()
+    user = find_user(db, identifier)
 
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(404, "User not found")
 
     user.deleted_at = func.now()
     db.commit()
 
-    return {"message": "User deleted successfully"}
+    return {
+        "message": "User deleted",
+        "id": user.id,
+        "uuid": str(user.cognito_user_id),
+    }
